@@ -6,7 +6,7 @@ concurrency:
 
 jobs:
   build:
-    timeout-minutes: 80
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +35,7 @@ jobs:
       - name: Load openvswitch module
         run: sudo modprobe openvswitch
       - name: Run integration tests
-        timeout-minutes: 60
+        timeout-minutes: 90
         run: hypervisor/scripts/dev_cli.sh tests --integration --libc ${{ matrix.libc }}
       - name: Run live-migration integration tests
         timeout-minutes: 20

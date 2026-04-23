@@ -128,7 +128,8 @@ popd
 # Build custom kernel based on virtio-pmem and virtio-fs upstream patches
 VMLINUX_IMAGE="$WORKLOADS_DIR/vmlinux"
 if [ ! -f "$VMLINUX_IMAGE" ]; then
-    build_custom_linux
+    wget --quiet https://github.com/lisongqian/CubeSandbox/releases/download/vmlinux/vmlinux || exit 1
+#    build_custom_linux
 fi
 
 VIRTIOFSD="$WORKLOADS_DIR/virtiofsd"
