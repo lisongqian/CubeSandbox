@@ -1367,20 +1367,34 @@ impl MemoryManager {
                     let file_len = fd.metadata().map(|m| m.len()).unwrap_or(0);
                     if file_len >= probe_len as u64 {
                         // One mmap over the whole file.
+                        // IMPORTANT: keep flags aligned with the real
+                        // fast_restore mmap done by create_ram_region()
+                        // in the `snap_file` branch (see below in this
+                        // same file). That path uses:
+                        //   PROT_READ | PROT_WRITE
+                        //   MAP_PRIVATE | MAP_NORESERVE [| MAP_POPULATE if prefault]
+                        // If we don't match, we may exercise a different
+                        // kernel mmap path (e.g. read-only vs CoW) and
+                        // the equal/not-equal result would not reflect
+                        // the actual restore behavior.
                         let file_len_usz = file_len as usize;
+                        let mut diag_flags = libc::MAP_PRIVATE | libc::MAP_NORESERVE;
+                        if prefault {
+                            diag_flags |= libc::MAP_POPULATE;
+                        }
                         let map_ptr = unsafe {
                             libc::mmap(
                                 std::ptr::null_mut(),
                                 file_len_usz,
-                                libc::PROT_READ,
-                                libc::MAP_PRIVATE,
+                                libc::PROT_READ | libc::PROT_WRITE,
+                                diag_flags,
                                 fd.as_raw_fd(),
                                 0,
                             )
                         };
                         if map_ptr == libc::MAP_FAILED {
-                            warn!(
-                                "[diag] whole-file mmap failed, len={}: {}",
+                            eprintln!(
+                                "[diag CH] whole-file mmap failed, len={}: {}",
                                 file_len,
                                 std::io::Error::last_os_error()
                             );
@@ -1436,13 +1450,13 @@ impl MemoryManager {
                                 if !eq {
                                     mismatched += 1;
                                 }
-                                info!(
-                                    "[diag] off={:#x} len={} equal={} read[..16]={} mmap[..16]={} first_diff={:?}",
+                                eprintln!(
+                                    "[diag CH] off={:#x} len={} equal={} read[..16]={} mmap[..16]={} first_diff={:?}",
                                     off, probe_len, eq, hex16_r, hex16_m, first_diff
                                 );
                             }
-                            info!(
-                                "[diag] one-mmap read-vs-mmap probe done, file_len={}, probes={}, mismatched={}",
+                            eprintln!(
+                                "[diag CH] one-mmap read-vs-mmap probe done, file_len={}, probes={}, mismatched={}",
                                 file_len,
                                 quarters.len(),
                                 mismatched
@@ -1452,8 +1466,8 @@ impl MemoryManager {
                             }
                         }
                     } else {
-                        info!(
-                            "[diag] skip probe: file_len={} < probe_len={}",
+                        eprintln!(
+                            "[diag CH] skip probe: file_len={} < probe_len={}",
                             file_len, probe_len
                         );
                     }
