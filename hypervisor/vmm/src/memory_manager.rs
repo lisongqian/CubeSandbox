@@ -1340,11 +1340,127 @@ impl MemoryManager {
             let fast_restore = Self::support_fast_restore_check(config);
             let memory_file = if fast_restore {
                 info!("restore non-shared map, speed up restore by share map memory file");
-                Some(
-                    memory_file_target
-                        .open_read()
-                        .map_err(Error::SnapshotOpen)?,
-                )
+                let fd = memory_file_target
+                    .open_read()
+                    .map_err(Error::SnapshotOpen)?;
+
+                // ---------------- diagnostic experiment ----------------
+                // Goal: check whether read(fd, ...) and mmap(fd, ...) on
+                // the SAME fd return the same bytes for the same offset.
+                // On xfs/ext4 they must; on tmpfs/overlay after another
+                // process pwrite()d anonymous pages, they may differ,
+                // which would nail the root cause down to a
+                // pagecache-vs-mmap divergence inside the kernel for
+                // loose FSes.
+                //
+                // Method: do ONE mmap covering the whole file (mirrors
+                // what create_ram_region does for guest RAM), then walk
+                // several offsets: at each offset read() a probe-sized
+                // slice from a cloned fd and compare it byte-by-byte
+                // against the mmap slice at the same offset. The mmap
+                // is munmap'd after all probes; the original fd is left
+                // intact for the real fast_restore path below.
+                {
+                    use std::io::Read;
+                    let page_sz = host_page_size() as usize;
+                    let probe_len = 4096usize.max(page_sz); // one page
+                    let file_len = fd.metadata().map(|m| m.len()).unwrap_or(0);
+                    if file_len >= probe_len as u64 {
+                        // One mmap over the whole file.
+                        let file_len_usz = file_len as usize;
+                        let map_ptr = unsafe {
+                            libc::mmap(
+                                std::ptr::null_mut(),
+                                file_len_usz,
+                                libc::PROT_READ,
+                                libc::MAP_PRIVATE,
+                                fd.as_raw_fd(),
+                                0,
+                            )
+                        };
+                        if map_ptr == libc::MAP_FAILED {
+                            warn!(
+                                "[diag] whole-file mmap failed, len={}: {}",
+                                file_len,
+                                std::io::Error::last_os_error()
+                            );
+                        } else {
+                            let map_all: &[u8] = unsafe {
+                                std::slice::from_raw_parts(map_ptr as *const u8, file_len_usz)
+                            };
+                            let mut fd_ro = fd.try_clone().map_err(Error::SnapshotOpen)?;
+                            // Probe offsets: 0, 1/4, 1/2, 3/4, end-probe.
+                            let mask = !(page_sz as u64 - 1);
+                            let quarters: [u64; 5] = [
+                                0,
+                                (file_len / 4) & mask,
+                                (file_len / 2) & mask,
+                                (file_len * 3 / 4) & mask,
+                                (file_len - probe_len as u64) & mask,
+                            ];
+                            let mut mismatched = 0usize;
+                            for &off in &quarters {
+                                let off_usz = off as usize;
+                                if off_usz + probe_len > file_len_usz {
+                                    continue;
+                                }
+                                // read() copy
+                                let mut buf_r = vec![0u8; probe_len];
+                                fd_ro
+                                    .seek(SeekFrom::Start(off))
+                                    .map_err(Error::SnapshotOpen)?;
+                                fd_ro
+                                    .read_exact(&mut buf_r)
+                                    .map_err(Error::SnapshotOpen)?;
+                                // mmap slice at same offset
+                                let buf_m = &map_all[off_usz..off_usz + probe_len];
+                                let eq = buf_r.as_slice() == buf_m;
+                                let first_diff = if eq {
+                                    None
+                                } else {
+                                    buf_r
+                                        .iter()
+                                        .zip(buf_m.iter())
+                                        .position(|(a, b)| a != b)
+                                };
+                                let hex16_r: String = buf_r[..16]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                let hex16_m: String = buf_m[..16]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<Vec<_>>()
+                                    .join("");
+                                if !eq {
+                                    mismatched += 1;
+                                }
+                                info!(
+                                    "[diag] off={:#x} len={} equal={} read[..16]={} mmap[..16]={} first_diff={:?}",
+                                    off, probe_len, eq, hex16_r, hex16_m, first_diff
+                                );
+                            }
+                            info!(
+                                "[diag] one-mmap read-vs-mmap probe done, file_len={}, probes={}, mismatched={}",
+                                file_len,
+                                quarters.len(),
+                                mismatched
+                            );
+                            unsafe {
+                                libc::munmap(map_ptr, file_len_usz);
+                            }
+                        }
+                    } else {
+                        info!(
+                            "[diag] skip probe: file_len={} < probe_len={}",
+                            file_len, probe_len
+                        );
+                    }
+                }
+                // -------------- end diagnostic experiment --------------
+
+                Some(fd)
             } else {
                 None
             };
